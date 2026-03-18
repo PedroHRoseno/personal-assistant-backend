@@ -818,7 +818,12 @@ def home_checklist_today(db: Session = Depends(get_db)):
 
     result: list[HomeChecklistWidgetRead] = []
     for task in tasks:
-        if task.task_type == HomeTaskType.DIARIA and not task.is_completed_today:
+        # Diárias aparecem apenas quando realmente pendentes no dia.
+        if (
+            task.task_type == HomeTaskType.DIARIA
+            and not task.is_completed_today
+            and task.status != "concluido"
+        ):
             result.append(
                 HomeChecklistWidgetRead(
                     id=task.id,
