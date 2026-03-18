@@ -490,6 +490,27 @@ def create_work_task(payload: WorkTaskCreate, db: Session = Depends(get_db)):
     )
 
 
+@app.get("/work-tasks/{task_id}", response_model=WorkTaskRead)
+def get_work_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(WorkTask).filter(WorkTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+    return WorkTaskRead(
+        id=task.id,
+        title=task.title,
+        description=task.description,
+        status=task.status,
+        priority=task.priority,
+        due_date=task.due_date,
+        context=task.context,
+        label=task.label,
+        context_id=task.context_id,
+        context_name=task.work_hub.name if task.work_hub else None,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
 @app.patch("/work-tasks/{task_id}", response_model=WorkTaskRead)
 def update_work_task(task_id: int, payload: WorkTaskUpdate, db: Session = Depends(get_db)):
     task = db.query(WorkTask).filter(WorkTask.id == task_id).first()
@@ -564,6 +585,25 @@ def create_study_task(payload: StudyTaskCreate, db: Session = Depends(get_db)):
     db.add(task)
     db.commit()
     db.refresh(task)
+    return StudyTaskRead(
+        id=task.id,
+        title=task.title,
+        description=task.description,
+        status=task.status,
+        priority=task.priority,
+        due_date=task.due_date,
+        course_id=task.course_id,
+        course_title=task.course.title if task.course else None,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+@app.get("/study-tasks/{task_id}", response_model=StudyTaskRead)
+def get_study_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(StudyTask).filter(StudyTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
     return StudyTaskRead(
         id=task.id,
         title=task.title,
@@ -715,6 +755,15 @@ def create_home_task(payload: HomeTaskCreate, db: Session = Depends(get_db)):
     return task
 
 
+@app.get("/home-tasks/{task_id}", response_model=HomeTaskRead)
+def get_home_task(task_id: int, db: Session = Depends(get_db)):
+    reset_daily_home_tasks(db)
+    task = db.query(HomeTask).filter(HomeTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+    return task
+
+
 @app.patch("/home-tasks/{task_id}", response_model=HomeTaskRead)
 def update_home_task(task_id: int, payload: HomeTaskUpdate, db: Session = Depends(get_db)):
     reset_daily_home_tasks(db)
@@ -769,7 +818,7 @@ def home_checklist_today(db: Session = Depends(get_db)):
 
     result: list[HomeChecklistWidgetRead] = []
     for task in tasks:
-        if task.task_type == HomeTaskType.DIARIA:
+        if task.task_type == HomeTaskType.DIARIA and not task.is_completed_today:
             result.append(
                 HomeChecklistWidgetRead(
                     id=task.id,
