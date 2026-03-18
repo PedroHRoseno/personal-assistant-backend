@@ -72,6 +72,11 @@ app.add_middleware(
 
 def run_lightweight_migrations():
     Base.metadata.create_all(bind=engine)
+    # Esta rotina de migração incremental foi criada para bancos SQLite legados
+    # (concatenação de string em datas, updates por LENGTH/TRIM, etc.).
+    # Em PostgreSQL (Railway), as tabelas novas já nascem corretas via create_all.
+    if engine.dialect.name != "sqlite":
+        return
 
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
