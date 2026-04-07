@@ -1,12 +1,23 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 import os
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from .database import Base, SessionLocal, engine
+from .task_repository import delete_by_id
+from .tasks_queries import (
+    query_all_home_tasks,
+    query_all_study_tasks,
+    query_all_work_tasks,
+    query_today_home_tasks,
+    query_today_study_tasks,
+    query_today_work_tasks,
+)
+from .unified_serializers import home_task_to_unified, study_task_to_unified, work_task_to_unified
 from .models import (
     Course,
     CoursePinnedLink,
@@ -14,7 +25,7 @@ from .models import (
     HomeTaskType,
     StudyPriority,
     StudyTask,
-    TaskCategory,
+    TaskStatus,
     WorkHub,
     WorkHubLink,
     WorkTask,
@@ -206,14 +217,25 @@ def get_db():
 
 
 def reset_daily_home_tasks(db: Session):
+    """Reabre tarefas diárias quando o dia virou (UTC) e corrige estados inconsistentes."""
     today = datetime.now(timezone.utc).date()
     daily_tasks = db.query(HomeTask).filter(HomeTask.task_type == HomeTaskType.DIARIA).all()
     changed = False
     for task in daily_tasks:
         last_day = task.last_completed.date() if task.last_completed else None
+        # Novo dia: limpar conclusão de ontem
         if last_day != today and task.is_completed_today:
             task.is_completed_today = False
-            task.status = "backlog"
+            task.status = TaskStatus.BACKLOG
+            changed = True
+            continue
+        # Inconsistência: marcada como concluída no status mas não "hoje" — reabrir para o checklist
+        if (
+            last_day != today
+            and task.status == TaskStatus.CONCLUIDO
+            and not task.is_completed_today
+        ):
+            task.status = TaskStatus.BACKLOG
             changed = True
     if changed:
         db.commit()
@@ -224,146 +246,65 @@ def health_check():
     return {"status": "ok"}
 
 
+def _reset_daily_home_tasks_session():
+    db = SessionLocal()
+    try:
+        reset_daily_home_tasks(db)
+    finally:
+        db.close()
+
+
+def _load_today_work(today: date) -> list[WorkTask]:
+    db = SessionLocal()
+    try:
+        return query_today_work_tasks(db, today)
+    finally:
+        db.close()
+
+
+def _load_today_study(today: date) -> list[StudyTask]:
+    db = SessionLocal()
+    try:
+        return query_today_study_tasks(db, today)
+    finally:
+        db.close()
+
+
+def _load_today_home(today: date) -> list[HomeTask]:
+    db = SessionLocal()
+    try:
+        return query_today_home_tasks(db, today)
+    finally:
+        db.close()
+
+
 @app.get("/tasks/today", response_model=list[UnifiedTaskRead])
-def list_today_tasks(db: Session = Depends(get_db)):
+async def list_today_tasks():
+    await asyncio.to_thread(_reset_daily_home_tasks_session)
     today = date.today()
-
-    work_tasks = (
-        db.query(WorkTask)
-        .filter((WorkTask.priority.is_(True)) | (func.date(WorkTask.due_date) == today.isoformat()))
-        .order_by(WorkTask.created_at.desc())
-        .all()
+    work_tasks, study_tasks, home_tasks = await asyncio.gather(
+        asyncio.to_thread(_load_today_work, today),
+        asyncio.to_thread(_load_today_study, today),
+        asyncio.to_thread(_load_today_home, today),
     )
-    study_tasks = (
-        db.query(StudyTask)
-        .filter(
-            (StudyTask.priority == StudyPriority.ALTA)
-            | (func.date(StudyTask.due_date) == today.isoformat())
-        )
-        .order_by(StudyTask.created_at.desc())
-        .all()
-    )
-    home_tasks = (
-        db.query(HomeTask)
-        .filter((HomeTask.priority.is_(True)) | (func.date(HomeTask.due_date) == today.isoformat()))
-        .order_by(HomeTask.created_at.desc())
-        .all()
-    )
-
-    response: list[UnifiedTaskRead] = []
-    for task in work_tasks:
-        response.append(
-            UnifiedTaskRead(
-                id=task.id,
-                task_type="work",
-                category=TaskCategory.TRABALHO,
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                priority=task.priority,
-                due_date=task.due_date.date() if task.due_date else None,
-                context=task.context,
-                context_id=task.context_id,
-                context_name=task.work_hub.name if task.work_hub else None,
-                label=task.label,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-        )
-    for task in study_tasks:
-        response.append(
-            UnifiedTaskRead(
-                id=task.id,
-                task_type="study",
-                category=TaskCategory.ESTUDOS,
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                priority=task.priority == StudyPriority.ALTA,
-                due_date=task.due_date.date() if task.due_date else None,
-                course_title=task.course.title if task.course else None,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-        )
-    for task in home_tasks:
-        response.append(
-            UnifiedTaskRead(
-                id=task.id,
-                task_type="home",
-                category=TaskCategory.CASA,
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                priority=task.priority,
-                due_date=task.due_date.date() if task.due_date else None,
-                zone=task.zone,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-        )
+    response: list[UnifiedTaskRead] = [
+        *[work_task_to_unified(t) for t in work_tasks],
+        *[study_task_to_unified(t) for t in study_tasks],
+        *[home_task_to_unified(t) for t in home_tasks],
+    ]
     return sorted(response, key=lambda task: (task.due_date is None, task.due_date, not task.priority))
 
 
 @app.get("/tasks/all", response_model=list[UnifiedTaskRead])
 def list_all_tasks(db: Session = Depends(get_db)):
-    work_tasks = db.query(WorkTask).order_by(WorkTask.created_at.desc()).all()
-    study_tasks = db.query(StudyTask).order_by(StudyTask.created_at.desc()).all()
-    home_tasks = db.query(HomeTask).order_by(HomeTask.created_at.desc()).all()
-
-    response: list[UnifiedTaskRead] = []
-    for task in work_tasks:
-        response.append(
-            UnifiedTaskRead(
-                id=task.id,
-                task_type="work",
-                category=TaskCategory.TRABALHO,
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                priority=task.priority,
-                due_date=task.due_date.date() if task.due_date else None,
-                context=task.context,
-                context_id=task.context_id,
-                context_name=task.work_hub.name if task.work_hub else None,
-                label=task.label,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-        )
-    for task in study_tasks:
-        response.append(
-            UnifiedTaskRead(
-                id=task.id,
-                task_type="study",
-                category=TaskCategory.ESTUDOS,
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                priority=task.priority == StudyPriority.ALTA,
-                due_date=task.due_date.date() if task.due_date else None,
-                course_title=task.course.title if task.course else None,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-        )
-    for task in home_tasks:
-        response.append(
-            UnifiedTaskRead(
-                id=task.id,
-                task_type="home",
-                category=TaskCategory.CASA,
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                priority=task.priority,
-                due_date=task.due_date.date() if task.due_date else None,
-                zone=task.zone,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-        )
-
+    work_tasks = query_all_work_tasks(db)
+    study_tasks = query_all_study_tasks(db)
+    home_tasks = query_all_home_tasks(db)
+    response: list[UnifiedTaskRead] = [
+        *[work_task_to_unified(t) for t in work_tasks],
+        *[study_task_to_unified(t) for t in study_tasks],
+        *[home_task_to_unified(t) for t in home_tasks],
+    ]
     return sorted(response, key=lambda task: (task.due_date is None, task.due_date, task.created_at))
 
 
@@ -440,7 +381,7 @@ def delete_work_hub_link(hub_id: int, link_id: int, db: Session = Depends(get_db
 
 @app.get("/work-tasks", response_model=list[WorkTaskRead])
 def list_work_tasks(context_id: int | None = Query(default=None), db: Session = Depends(get_db)):
-    query = db.query(WorkTask)
+    query = db.query(WorkTask).options(joinedload(WorkTask.work_hub))
     if context_id is not None:
         query = query.filter(WorkTask.context_id == context_id)
     tasks = query.order_by(WorkTask.created_at.desc()).all()
@@ -492,7 +433,12 @@ def create_work_task(payload: WorkTaskCreate, db: Session = Depends(get_db)):
 
 @app.get("/work-tasks/{task_id}", response_model=WorkTaskRead)
 def get_work_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(WorkTask).filter(WorkTask.id == task_id).first()
+    task = (
+        db.query(WorkTask)
+        .options(joinedload(WorkTask.work_hub))
+        .filter(WorkTask.id == task_id)
+        .first()
+    )
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
     return WorkTaskRead(
@@ -513,7 +459,12 @@ def get_work_task(task_id: int, db: Session = Depends(get_db)):
 
 @app.patch("/work-tasks/{task_id}", response_model=WorkTaskRead)
 def update_work_task(task_id: int, payload: WorkTaskUpdate, db: Session = Depends(get_db)):
-    task = db.query(WorkTask).filter(WorkTask.id == task_id).first()
+    task = (
+        db.query(WorkTask)
+        .options(joinedload(WorkTask.work_hub))
+        .filter(WorkTask.id == task_id)
+        .first()
+    )
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
 
@@ -544,16 +495,13 @@ def update_work_task(task_id: int, payload: WorkTaskUpdate, db: Session = Depend
 
 @app.delete("/work-tasks/{task_id}", status_code=204)
 def delete_work_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(WorkTask).filter(WorkTask.id == task_id).first()
-    if not task:
+    if not delete_by_id(db, WorkTask, task_id):
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
-    db.delete(task)
-    db.commit()
 
 
 @app.get("/study-tasks", response_model=list[StudyTaskRead])
 def list_study_tasks(course_id: int | None = Query(default=None), db: Session = Depends(get_db)):
-    query = db.query(StudyTask)
+    query = db.query(StudyTask).options(joinedload(StudyTask.course))
     if course_id is not None:
         query = query.filter(StudyTask.course_id == course_id)
     tasks = query.order_by(StudyTask.created_at.desc()).all()
@@ -601,7 +549,12 @@ def create_study_task(payload: StudyTaskCreate, db: Session = Depends(get_db)):
 
 @app.get("/study-tasks/{task_id}", response_model=StudyTaskRead)
 def get_study_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(StudyTask).filter(StudyTask.id == task_id).first()
+    task = (
+        db.query(StudyTask)
+        .options(joinedload(StudyTask.course))
+        .filter(StudyTask.id == task_id)
+        .first()
+    )
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
     return StudyTaskRead(
@@ -620,7 +573,12 @@ def get_study_task(task_id: int, db: Session = Depends(get_db)):
 
 @app.patch("/study-tasks/{task_id}", response_model=StudyTaskRead)
 def update_study_task(task_id: int, payload: StudyTaskUpdate, db: Session = Depends(get_db)):
-    task = db.query(StudyTask).filter(StudyTask.id == task_id).first()
+    task = (
+        db.query(StudyTask)
+        .options(joinedload(StudyTask.course))
+        .filter(StudyTask.id == task_id)
+        .first()
+    )
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
 
@@ -649,11 +607,8 @@ def update_study_task(task_id: int, payload: StudyTaskUpdate, db: Session = Depe
 
 @app.delete("/study-tasks/{task_id}", status_code=204)
 def delete_study_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(StudyTask).filter(StudyTask.id == task_id).first()
-    if not task:
+    if not delete_by_id(db, StudyTask, task_id):
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
-    db.delete(task)
-    db.commit()
 
 
 @app.get("/courses", response_model=list[CourseRead])
@@ -755,6 +710,47 @@ def create_home_task(payload: HomeTaskCreate, db: Session = Depends(get_db)):
     return task
 
 
+@app.get("/home-tasks/checklist-today", response_model=list[HomeChecklistWidgetRead])
+def home_checklist_today(db: Session = Depends(get_db)):
+    reset_daily_home_tasks(db)
+    today = date.today()
+    tasks = db.query(HomeTask).order_by(HomeTask.created_at.asc()).all()
+
+    result: list[HomeChecklistWidgetRead] = []
+    for task in tasks:
+        # Diárias: fonte de verdade é is_completed_today (evita ficar fora do checklist se status ficou preso em concluído).
+        if task.task_type == HomeTaskType.DIARIA and not task.is_completed_today:
+            result.append(
+                HomeChecklistWidgetRead(
+                    id=task.id,
+                    title=task.title,
+                    task_type=task.task_type,
+                    due_date=task.due_date,
+                    is_completed_today=task.is_completed_today,
+                )
+            )
+            continue
+
+        if task.task_type in (HomeTaskType.OCASIONAL, HomeTaskType.ESPECIFICA):
+            if task.due_date and task.due_date.date() <= today and task.status != TaskStatus.CONCLUIDO:
+                result.append(
+                    HomeChecklistWidgetRead(
+                        id=task.id,
+                        title=task.title,
+                        task_type=task.task_type,
+                        due_date=task.due_date,
+                        is_completed_today=task.is_completed_today,
+                    )
+                )
+    return result
+
+
+@app.post("/home-tasks/reset-daily")
+def reset_home_tasks_daily(db: Session = Depends(get_db)):
+    reset_daily_home_tasks(db)
+    return {"status": "ok"}
+
+
 @app.get("/home-tasks/{task_id}", response_model=HomeTaskRead)
 def get_home_task(task_id: int, db: Session = Depends(get_db)):
     reset_daily_home_tasks(db)
@@ -780,21 +776,20 @@ def update_home_task(task_id: int, payload: HomeTaskUpdate, db: Session = Depend
     if "is_completed_today" in changed_fields and task.is_completed_today:
         task.last_completed = datetime.now(timezone.utc)
         if task.task_type == HomeTaskType.DIARIA:
-            task.status = "concluido"
+            task.status = TaskStatus.CONCLUIDO
 
-    if "status" in changed_fields and task.status == "concluido":
+    if "status" in changed_fields and task.status == TaskStatus.CONCLUIDO:
         task.last_completed = datetime.now(timezone.utc)
         if task.task_type == HomeTaskType.DIARIA:
             task.is_completed_today = True
         if task.task_type == HomeTaskType.OCASIONAL:
-            days = task.recurrence_interval or 0
-            if days > 0:
-                task.due_date = datetime.now(timezone.utc) + timedelta(days=days)
-            task.status = "backlog"
+            days = max(1, task.recurrence_interval or 1)
+            task.due_date = datetime.now(timezone.utc) + timedelta(days=days)
+            task.status = TaskStatus.BACKLOG
         if task.task_type == HomeTaskType.ESPECIFICA:
             task.is_completed_today = True
 
-    if "status" in changed_fields and task.status != "concluido" and task.task_type == HomeTaskType.DIARIA:
+    if "status" in changed_fields and task.status != TaskStatus.CONCLUIDO and task.task_type == HomeTaskType.DIARIA:
         task.is_completed_today = False
     db.commit()
     db.refresh(task)
@@ -803,53 +798,5 @@ def update_home_task(task_id: int, payload: HomeTaskUpdate, db: Session = Depend
 
 @app.delete("/home-tasks/{task_id}", status_code=204)
 def delete_home_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(HomeTask).filter(HomeTask.id == task_id).first()
-    if not task:
+    if not delete_by_id(db, HomeTask, task_id):
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
-    db.delete(task)
-    db.commit()
-
-
-@app.get("/home-tasks/checklist-today", response_model=list[HomeChecklistWidgetRead])
-def home_checklist_today(db: Session = Depends(get_db)):
-    reset_daily_home_tasks(db)
-    today = date.today()
-    tasks = db.query(HomeTask).order_by(HomeTask.created_at.asc()).all()
-
-    result: list[HomeChecklistWidgetRead] = []
-    for task in tasks:
-        # Diárias aparecem apenas quando realmente pendentes no dia.
-        if (
-            task.task_type == HomeTaskType.DIARIA
-            and not task.is_completed_today
-            and task.status != "concluido"
-        ):
-            result.append(
-                HomeChecklistWidgetRead(
-                    id=task.id,
-                    title=task.title,
-                    task_type=task.task_type,
-                    due_date=task.due_date,
-                    is_completed_today=task.is_completed_today,
-                )
-            )
-            continue
-
-        if task.task_type in (HomeTaskType.OCASIONAL, HomeTaskType.ESPECIFICA):
-            if task.due_date and task.due_date.date() <= today and task.status != "concluido":
-                result.append(
-                    HomeChecklistWidgetRead(
-                        id=task.id,
-                        title=task.title,
-                        task_type=task.task_type,
-                        due_date=task.due_date,
-                        is_completed_today=task.is_completed_today,
-                    )
-                )
-    return result
-
-
-@app.post("/home-tasks/reset-daily")
-def reset_home_tasks_daily(db: Session = Depends(get_db)):
-    reset_daily_home_tasks(db)
-    return {"status": "ok"}

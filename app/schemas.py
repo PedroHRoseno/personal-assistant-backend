@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 from .models import HomeTaskType, StudyPriority, TaskCategory, TaskStatus, WorkContext, WorkLabel
 
@@ -107,6 +107,8 @@ class HomeTaskRead(BaseTaskFields):
 
 
 class HomeChecklistWidgetRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
     id: int
     title: str
     task_type: HomeTaskType
