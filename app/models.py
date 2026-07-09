@@ -1,6 +1,6 @@
 import enum
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Enum, Integer, String, Text, func
 from sqlalchemy import ForeignKey
 from sqlalchemy.orm import relationship
 
@@ -144,3 +144,13 @@ class WorkHubLink(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     hub = relationship("WorkHub", back_populates="links")
+
+
+class PomodoroSession(Base):
+    __tablename__ = "pomodoro_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    focus_minutes = Column(Integer, nullable=False)
+    break_minutes = Column(Integer, nullable=False)
+    session_day = Column(Date, nullable=False, index=True)
+    completed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)

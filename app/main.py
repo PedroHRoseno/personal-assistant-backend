@@ -23,6 +23,7 @@ from .models import (
     CoursePinnedLink,
     HomeTask,
     HomeTaskType,
+    PomodoroSession,
     StudyPriority,
     StudyTask,
     TaskStatus,
@@ -41,6 +42,9 @@ from .schemas import (
     HomeChecklistWidgetRead,
     HomeTaskRead,
     HomeTaskUpdate,
+    PomodoroDailySummary,
+    PomodoroSessionCreate,
+    PomodoroSessionRead,
     StudyTaskCreate,
     StudyTaskRead,
     StudyTaskUpdate,
@@ -244,6 +248,40 @@ def reset_daily_home_tasks(db: Session):
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.post("/pomodoro/sessions", response_model=PomodoroSessionRead, status_code=201)
+def create_pomodoro_session(payload: PomodoroSessionCreate, db: Session = Depends(get_db)):
+    session_day = payload.day or date.today()
+    session = PomodoroSession(
+        focus_minutes=max(1, payload.focus_minutes),
+        break_minutes=max(1, payload.break_minutes),
+        session_day=session_day,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+@app.get("/pomodoro/sessions/today", response_model=PomodoroDailySummary)
+def get_pomodoro_daily_summary(
+    day: date | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    target_day = day or date.today()
+    sessions = (
+        db.query(PomodoroSession)
+        .filter(PomodoroSession.session_day == target_day)
+        .order_by(PomodoroSession.completed_at.asc())
+        .all()
+    )
+    return PomodoroDailySummary(
+        day=target_day,
+        count=len(sessions),
+        total_focus_minutes=sum(session.focus_minutes for session in sessions),
+        sessions=sessions,
+    )
 
 
 def _reset_daily_home_tasks_session():

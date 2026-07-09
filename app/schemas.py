@@ -230,3 +230,26 @@ class CourseRead(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PomodoroSessionCreate(BaseModel):
+    focus_minutes: int
+    break_minutes: int
+    day: Optional[date] = None
+
+
+class PomodoroSessionRead(BaseModel):
+    id: int
+    focus_minutes: int
+    break_minutes: int
+    session_day: date
+    completed_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PomodoroDailySummary(BaseModel):
+    day: date
+    count: int
+    total_focus_minutes: int
+    sessions: list[PomodoroSessionRead]
