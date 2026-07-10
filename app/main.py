@@ -69,6 +69,11 @@ app = FastAPI(
 raw_cors = os.getenv("BACKEND_CORS_ORIGINS", "")
 cors_origins = [origin.strip().rstrip("/") for origin in raw_cors.split(",") if origin.strip()]
 
+# "*" habilita qualquer origem no browser (Starlette: allow_all_origins).
+# Apps nativos (Android/iOS) não enviam preflight CORS — não dependem desta config.
+if "*" in cors_origins:
+    cors_origins = ["*"]
+
 # Para desenvolvimento local sem precisar de configuração extra.
 if not cors_origins:
     cors_origins = [
